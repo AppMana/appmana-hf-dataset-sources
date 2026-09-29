@@ -67,6 +67,28 @@ Git LFS objects, and redirects both `datasets.load_dataset` and
 `huggingface_hub.snapshot_download` to the checkout. `APPMANA_HF_GIT_TOKEN`,
 `APPMANA_GIT_LFS_URL`, and `APPMANA_GIT_LFS_SECRET` configure private access.
 
+When datasets need different LFS secrets in one process, give each repository
+its own. Either map repository IDs (or `prefix/`) to secrets, used with each
+repository's committed `.lfsconfig`:
+
+```shell
+export APPMANA_GIT_LFS_SECRETS='{"example/first":"<secret>","example/second":"<secret>"}'
+```
+
+or point at a directory with one subdirectory per repository, holding a
+`client-secret` file and optionally a `url` file that overrides the committed
+endpoint. Mounting one Kubernetes Secret with those keys per repository at
+`<dir>/<owner>/<name>` produces exactly this layout:
+
+```shell
+export APPMANA_GIT_LFS_CREDENTIALS_DIR=/var/run/secrets/git-lfs
+# /var/run/secrets/git-lfs/example/first/client-secret
+# /var/run/secrets/git-lfs/example/second/client-secret
+```
+
+A repository found in either place uses its own secret; the global
+`APPMANA_GIT_LFS_URL`/`APPMANA_GIT_LFS_SECRET` pair applies to the others.
+
 The generic map also supports explicit Git descriptors:
 
 ```json

@@ -179,6 +179,90 @@ def test_url_source_requires_explicit_hf_format(monkeypatch):
         shim.resolve("vendor/data")
 
 
+@pytest.fixture()
+def lfs_repos(tmp_path):
+    """Two bare git 'remotes' whose committed .lfsconfig names their own LFS endpoint."""
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    remote = tmp_path / "lfs-remote"
+    remote.mkdir()
+    for name in ("first", "second"):
+        work = tmp_path / ("work-" + name)
+        work.mkdir()
+        (work / ".lfsconfig").write_text("[lfs]\n\turl = https://lfs.example/lfsorg/%s\n" % name)
+        (work / "README.md").write_text(name + "\n")
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=work, check=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=work, check=True, env=env)
+        subprocess.run(["git", "clone", "-q", "--bare", str(work), str(remote / (name + ".git"))], check=True, env=env)
+    return remote
+
+
+def _configure_lfs_repos(monkeypatch, tmp_path, lfs_repos):
+    monkeypatch.setenv("APPMANA_HF_GIT_MAP", json.dumps({"lfsorg/": lfs_repos.as_uri() + "/"}))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+    for name in ("APPMANA_GIT_LFS_URL", "APPMANA_GIT_LFS_SECRET", "APPMANA_GIT_LFS_SECRETS",
+                 "APPMANA_GIT_LFS_CREDENTIALS_DIR", "APPMANA_HF_GIT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    import appmana_hf_git_datasets as shim
+
+    return shim
+
+
+def _stored_credentials(local):
+    return (Path(local) / ".git" / "appmana-lfs-credentials").read_text().splitlines()
+
+
+def _lfs_url(local):
+    out = subprocess.run(["git", "config", "lfs.url"], cwd=local, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def test_lfs_secrets_map_gives_each_repository_its_own_secret(monkeypatch, tmp_path, lfs_repos):
+    shim = _configure_lfs_repos(monkeypatch, tmp_path, lfs_repos)
+    monkeypatch.setenv("APPMANA_GIT_LFS_SECRETS", json.dumps({"lfsorg/first": "s1", "lfsorg/second": "s2"}))
+    assert _stored_credentials(shim.ensure_local("lfsorg/first")) == ["https://t:s1@lfs.example"]
+    assert _stored_credentials(shim.ensure_local("lfsorg/second")) == ["https://t:s2@lfs.example"]
+
+
+def test_lfs_secrets_map_prefix_entry(monkeypatch, tmp_path, lfs_repos):
+    shim = _configure_lfs_repos(monkeypatch, tmp_path, lfs_repos)
+    monkeypatch.setenv("APPMANA_GIT_LFS_SECRETS", json.dumps({"lfsorg/": "shared", "lfsorg/second": "s2"}))
+    assert shim.lfs_credentials("lfsorg/first") == (None, "shared")
+    assert shim.lfs_credentials("lfsorg/second") == (None, "s2")
+    assert shim.lfs_credentials("other/first") == (None, None)
+
+
+def test_lfs_credentials_dir_discovers_mounted_secret_per_repository(monkeypatch, tmp_path, lfs_repos):
+    shim = _configure_lfs_repos(monkeypatch, tmp_path, lfs_repos)
+    mounts = tmp_path / "git-lfs"
+    for name, secret in (("first", "d1"), ("second", "d2")):
+        mount = mounts / "lfsorg" / name
+        mount.mkdir(parents=True)
+        (mount / "client-secret").write_text(secret + "\n")
+        (mount / "url").write_text("https://lfs.mounted/lfsorg/%s" % name)
+    monkeypatch.setenv("APPMANA_GIT_LFS_CREDENTIALS_DIR", str(mounts))
+    first = shim.ensure_local("lfsorg/first")
+    second = shim.ensure_local("lfsorg/second")
+    assert _stored_credentials(first) == ["https://t:d1@lfs.mounted"]
+    assert _stored_credentials(second) == ["https://t:d2@lfs.mounted"]
+    assert _lfs_url(first) == "https://lfs.mounted/lfsorg/first"
+    assert _lfs_url(second) == "https://lfs.mounted/lfsorg/second"
+
+
+def test_per_repository_secret_overrides_global_pair(monkeypatch, tmp_path, lfs_repos):
+    shim = _configure_lfs_repos(monkeypatch, tmp_path, lfs_repos)
+    monkeypatch.setenv("APPMANA_GIT_LFS_URL", "https://lfs.global/lfsorg/first")
+    monkeypatch.setenv("APPMANA_GIT_LFS_SECRET", "global")
+    monkeypatch.setenv("APPMANA_GIT_LFS_SECRETS", json.dumps({"lfsorg/second": "s2"}))
+    first = shim.ensure_local("lfsorg/first")
+    second = shim.ensure_local("lfsorg/second")
+    assert _stored_credentials(first) == ["https://t:global@lfs.global"]
+    assert _lfs_url(first) == "https://lfs.global/lfsorg/first"
+    # the global URL belongs to the global secret; the second repository keeps its .lfsconfig
+    assert _stored_credentials(second) == ["https://t:s2@lfs.example"]
+    assert _lfs_url(second) == ""
+
+
 def test_poisoned_cache_recovers(monkeypatch, tmp_path, fixture_repo):
     shim = _configure(monkeypatch, tmp_path, fixture_repo)
     # simulate a failed prior clone: .git dir exists but no usable HEAD

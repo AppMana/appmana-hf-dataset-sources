@@ -16,6 +16,14 @@ Configured entirely by environment variables; a no-op when unconfigured:
   endpoint override and its client secret. When unset, the repo's committed
   ``.lfsconfig`` endpoint is used with ``APPMANA_HF_GIT_TOKEN``-less anonymous
   access, so private LFS requires the secret.
+- ``APPMANA_GIT_LFS_SECRETS``: JSON object mapping a repo id or ``prefix/`` to
+  that repository's LFS secret, used with its committed ``.lfsconfig``.
+- ``APPMANA_GIT_LFS_CREDENTIALS_DIR``: a directory holding
+  ``<owner>/<name>/client-secret`` and optionally ``<owner>/<name>/url`` per
+  repository, e.g. one mounted Kubernetes Secret per dataset.
+  A repository named by either of these uses its own secret; the global
+  ``APPMANA_GIT_LFS_URL``/``APPMANA_GIT_LFS_SECRET`` pair applies to the rest,
+  so one process can load datasets whose LFS servers need different secrets.
 
 Activation is automatic via a ``.pth`` at interpreter startup (see ``_auto``),
 which registers post-import hooks so ``datasets.load_dataset`` and
@@ -39,6 +47,8 @@ _ENV_SOURCE_MAP = "APPMANA_HF_SOURCE_MAP"
 _ENV_TOKEN = "APPMANA_HF_GIT_TOKEN"
 _ENV_LFS_URL = "APPMANA_GIT_LFS_URL"
 _ENV_LFS_SECRET = "APPMANA_GIT_LFS_SECRET"
+_ENV_LFS_SECRETS = "APPMANA_GIT_LFS_SECRETS"
+_ENV_LFS_CREDENTIALS_DIR = "APPMANA_GIT_LFS_CREDENTIALS_DIR"
 
 _installed = False
 
@@ -190,12 +200,61 @@ def _authed_url(url: str) -> str:
     return url
 
 
-def _configure_lfs(clone_dir: Path):
+def _lfs_secrets_map() -> dict:
+    raw = os.environ.get(_ENV_LFS_SECRETS, "")
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("%s is not valid JSON; ignoring", _ENV_LFS_SECRETS)
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("%s must be a JSON object; ignoring", _ENV_LFS_SECRETS)
+        return {}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _read_stripped(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def lfs_credentials(repo_id: str):
+    """Return ``(lfs_url, secret)`` for *repo_id* from its own configuration.
+
+    ``APPMANA_GIT_LFS_SECRETS`` (exact id, else the longest ``prefix/``) is
+    consulted first, then ``APPMANA_GIT_LFS_CREDENTIALS_DIR/<owner>/<name>/``
+    with a ``client-secret`` file and an optional ``url`` file (a mounted
+    Kubernetes Secret). ``(None, None)`` when neither names the repository;
+    the global ``APPMANA_GIT_LFS_URL``/``APPMANA_GIT_LFS_SECRET`` pair then
+    applies.
+    """
+    matched = _mapping_match(repo_id, _lfs_secrets_map())
+    if matched is not None:
+        return None, matched[2]
+    root = os.environ.get(_ENV_LFS_CREDENTIALS_DIR, "")
+    if root and "/" in repo_id:
+        mount = Path(root).joinpath(*repo_id.split("/"))
+        secret = _read_stripped(mount / "client-secret")
+        if secret:
+            return _read_stripped(mount / "url") or None, secret
+    return None, None
+
+
+def _configure_lfs(clone_dir: Path, repo_id: str = ""):
     """Write repo-local LFS credentials (never global)."""
     cred_file = clone_dir / ".git" / "appmana-lfs-credentials"
     lines = []
-    lfs_url = os.environ.get(_ENV_LFS_URL, "")
-    lfs_secret = os.environ.get(_ENV_LFS_SECRET, "")
+    repo_url, repo_secret = lfs_credentials(repo_id) if repo_id else (None, None)
+    if repo_secret:
+        lfs_url = repo_url or ""
+        lfs_secret = repo_secret
+    else:
+        lfs_url = os.environ.get(_ENV_LFS_URL, "")
+        lfs_secret = os.environ.get(_ENV_LFS_SECRET, "")
     if lfs_url:
         _run(["git", "config", "lfs.url", lfs_url], cwd=clone_dir)
     if lfs_secret:
@@ -271,9 +330,9 @@ def ensure_local(repo_id: str, revision=None) -> str:
             raise RuntimeError("git clone of %s produced no usable checkout" % repo_id)
         # keep the remote url credential-free
         _run(["git", "remote", "set-url", "origin", clone_url], cwd=target)
-        _configure_lfs(target)
+        _configure_lfs(target, repo_id)
     else:
-        _configure_lfs(target)
+        _configure_lfs(target, repo_id)
         _run(["git", "fetch", "--depth", "1", _authed_url(clone_url)], cwd=target, check=False)
     if revision:
         checkout = _run(["git", "checkout", str(revision)], cwd=target, check=False)

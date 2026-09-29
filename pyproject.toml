@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "appmana-hf-git-datasets"
-version = "0.2.0"
+version = "0.3.0"
 description = "Resolve Hugging Face dataset ids to Git remotes or arbitrary URLs"
 readme = "README.md"
 requires-python = ">=3.10"
